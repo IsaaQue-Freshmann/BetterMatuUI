@@ -1,0 +1,18 @@
+{
+  "docs": [
+    {
+      "id": "student_manual",
+      "title": "学生手册",
+      "file": "student_manual.md",
+      "url": "/aptat/page/document/student_operation_guide.htm",
+      "lines": 33
+    },
+    {
+      "id": "commit_attention",
+      "title": "学生提交注意事项",
+      "file": "commit_attention.md",
+      "url": "/aptat/page/document/assignment_commit_attention.htm",
+      "lines": 131
+    }
+  ]
+}

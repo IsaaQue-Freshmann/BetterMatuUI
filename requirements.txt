@@ -1,0 +1,8 @@
+# 运行期依赖
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+PySide6>=6.6          # cp39-abi3 稳定 ABI，Python 3.9 也能装最新版
+
+# 打包时额外需要（可选）
+# pyinstaller>=6.0
