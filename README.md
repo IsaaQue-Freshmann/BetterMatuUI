@@ -1,6 +1,6 @@
 # BetterMatuUI
 
-码图（[matu.uestc.edu.cn](http://matu.uestc.edu.cn)）的**桌面客户端**：把uestc C 语言作业平台
+码图（[matu.uestc.edu.cn](http://matu.uestc.edu.cn)）的**桌面客户端**：把 uestc C 语言作业平台
 套一层简洁现代的原生界面，并把题库、提交、评测结果和统计数据搬到本地。
 
 用 Python + PySide6 写成，界面是**全矢量**——图标是内嵌 SVG 路径，形状、圆角、
@@ -156,18 +156,18 @@ docs/                     接口文档与设计文档
 
 
 
+***
 
 
 
 
-
-
+***
 
 
 assisted by DeepSeek
 
-Thanks to @violet for the help of testing
+Thanks to @violet(uestc) for the help of testing
 
 
-
+***
 @ IsaaQue Freshmann SCU
