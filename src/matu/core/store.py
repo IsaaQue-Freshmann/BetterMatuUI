@@ -1,6 +1,6 @@
 """本地存储：SQLite 落库 + JSON 快照导出。
 
-设计成可断点续爬：每题记录 detail_fetched 标记，重跑只补没抓到的部分，
+设计成可断点续传：每题记录 detail_fetched 标记，重跑只补没抓到的部分，
 不会重复请求已经拿过的页面。
 """
 
@@ -365,7 +365,8 @@ class Store:
                      from_assignment_id: int = 0) -> int:
         """新建一个本地文件。名字默认按时间取，重名自动加序号。"""
         if not name:
-            name = f"新文件 {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            # 带题目编号：一眼能看出这份文件属于哪道题，也避免跨题混淆
+            name = f"#{task_id} 新文件 {time.strftime('%Y-%m-%d %H:%M:%S')}"
         base, n = name, 1
         while self.conn.execute("SELECT 1 FROM drafts WHERE task_id=? AND name=?",
                                 (task_id, name)).fetchone():

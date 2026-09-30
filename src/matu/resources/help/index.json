@@ -13,6 +13,13 @@
       "file": "commit_attention.md",
       "url": "/aptat/page/document/assignment_commit_attention.htm",
       "lines": 131
+    },
+    {
+      "id": "about",
+      "title": "关于 BetterMatuUI",
+      "file": "about_bettermatu.md",
+      "url": "",
+      "lines": 173
     }
   ]
 }

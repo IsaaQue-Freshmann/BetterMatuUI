@@ -3,7 +3,7 @@
 #
 #   mac/build_dmg.sh                     # 用 output/mac/build/BetterMatuUI.app
 #
-# 产物：output/mac/BetterMatuUI Beta 1.0.dmg
+# 产物：output/mac/BetterMatuUI Beta 1.2.dmg
 #
 # 安装界面：左边是应用图标，右边是 Applications 文件夹的软链，
 # 用户直接把图标拖到右边即完成安装。
@@ -12,7 +12,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="BetterMatuUI"
-VOL_NAME="BetterMatuUI Beta 1.0"
+VOL_NAME="BetterMatuUI Beta 1.2"
 DMG_OUT="$ROOT/output/mac/$VOL_NAME.dmg"
 
 APP="$ROOT/output/mac/build/$APP_NAME.app"

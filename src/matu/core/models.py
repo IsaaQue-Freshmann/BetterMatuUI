@@ -8,7 +8,7 @@ from typing import Optional
 
 @dataclass
 class Task:
-    """一道题目的全部可加载信息。
+    """一道题目在列表与详情页里能取到的全部信息。
 
     字段与 `题目总表` 的列一一对应，description 来自题目详情页。
     """

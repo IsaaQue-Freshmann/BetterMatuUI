@@ -29,13 +29,14 @@ class Config:
     # 窗口
     sidebar_collapsed: bool = True      # 默认就是简洁（图标）模式
 
-    # 当前账号：数据与缓存都按它隔离，换账号就要重新爬
+    # 当前账号：数据与缓存都按它隔离，换账号就要重新加载
     active_account: str = ""
 
     # 请求策略
-    request_interval: float = 0.3
+    request_interval: float = 0.1
     max_requests_per_run: int = 2048
     allow_submission: bool = True   # 提交总闸（界面上可关，关了就不会有任何提交）
+    session_check_minutes: int = 30  # 每隔多久探一次登录态，掉了自动补登录
 
     # 提示
     skip_submit_confirm: bool = False   # "记住我的选择"

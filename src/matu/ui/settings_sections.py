@@ -50,7 +50,7 @@ def field_qss() -> str:
 
 
 class BankCrawlWorker(QThread):
-    """为当前账号整份爬题库。
+    """为当前账号整份加载题库。
 
     换账号后必须整份重来：「题目总表」返回的是**该账号可见**的题，
     内容随账号不同，不能沿用上一个账号的结果。
@@ -61,7 +61,7 @@ class BankCrawlWorker(QThread):
     done = Signal(dict)
     failed = Signal(str)
 
-    CRAWL_INTERVAL = 0.2          # 与界面其它入口保持一致：0.2 秒/题
+    CRAWL_INTERVAL = 0.1          # 与界面其它入口保持一致：0.2 秒/题
     CRAWL_JITTER = 0.05
     MAX_REQUESTS = 700
 
@@ -207,7 +207,7 @@ class SettingsSections(QWidget):
         self._accounts_layout.setSpacing(6)
         cl.addWidget(self._accounts_host)
 
-        # 加载按钮：换账号后必须整份重爬，这个入口就为它准备
+        # 加载按钮：换账号后必须整份重新加载，这个入口就为它准备
         crow = QWidget(self)
         cbl = QHBoxLayout(crow)
         cbl.setContentsMargins(0, 6, 0, 0)
@@ -301,7 +301,7 @@ class SettingsSections(QWidget):
         self._ws.switch_account(username)
         self._accounts_msg.setText(
             f"已切换到账号 {username}。它的缓存里已有 {self._ws.store.stats()['题目总数']} 道题；"
-            f"如果内容不是最新的，去「我的班级」点刷新重新爬一次。")
+            f"如果内容不是最新的，去「我的班级」点刷新重新加载一次。")
         self.refresh_accounts()
         self.account_switched.emit()
 
@@ -311,7 +311,7 @@ class SettingsSections(QWidget):
         box = QMessageBox(self)
         box.setWindowTitle("删除缓存")
         box.setText(f"确定删除账号 {username} 的全部本地缓存吗？{active_note}")
-        box.setInformativeText("只删除这台机器上爬下来的数据，不会影响站点上的任何内容，"
+        box.setInformativeText("只删除这台机器上加载下来的数据，不会影响站点上的任何内容，"
                                "也删不掉已经提交的作业。下次登录该账号需要重新加载。")
         box.setStandardButtons(QMessageBox.StandardButton.Cancel
                                | QMessageBox.StandardButton.Yes)
@@ -330,7 +330,7 @@ class SettingsSections(QWidget):
     def _toggle_bank_crawl(self) -> None:
         if self._bank_worker is not None and self._bank_worker.isRunning():
             self._bank_worker.stop()
-            self._crawl_progress.setText("正在停止…已抓到的部分已经落库，下次可续爬。")
+            self._crawl_progress.setText("正在停止…已抓到的部分已经落库，下次可续传。")
             return
         if not self._ws.has_account:
             self._crawl_progress.setText("还没有账号。先到上面的账号卡片里登录。")
@@ -423,6 +423,13 @@ class SettingsSections(QWidget):
         self._max_req.valueChanged.connect(self._on_requests)
         self._row(cl, "单次请求上限", self._max_req)
 
+        self._session_min = VectorSpin(
+            self, minimum=1, maximum=240,
+            value=int(self._config.session_check_minutes), step=5,
+            suffix=" 分钟", width=150)
+        self._session_min.valueChanged.connect(self._on_requests)
+        self._row(cl, "登录态检测间隔", self._session_min)
+
         self._allow_submit = QCheckBox("允许提交代码到站点", self)
         self._allow_submit.setChecked(self._config.allow_submission)
         self._allow_submit.stateChanged.connect(self._on_requests)
@@ -433,7 +440,8 @@ class SettingsSections(QWidget):
         self._skip_confirm.stateChanged.connect(self._on_requests)
         cl.addWidget(self._skip_confirm)
 
-        self._hint(cl, "所有请求串行发送并保持最小间隔，不做轮询、不自动重试。"
+        self._hint(cl, "登录态会按上面的间隔探一次，掉了自动用本次会话的凭据补登录。"
+                       "所有请求串行发送并保持最小间隔，不做轮询、不自动重试。"
                        "关掉「允许提交」后，提交请求会被代码层直接拒绝。")
 
     def _build_data(self, lay: QVBoxLayout) -> None:
@@ -506,6 +514,7 @@ class SettingsSections(QWidget):
         self._config.max_requests_per_run = self._max_req.value()
         self._config.allow_submission = self._allow_submit.isChecked()
         self._config.skip_submit_confirm = self._skip_confirm.isChecked()
+        self._config.session_check_minutes = self._session_min.value()
         self._config.save()
         # 立刻生效：同步到网络客户端，不必重启
         client = getattr(self._ws, "client", None)

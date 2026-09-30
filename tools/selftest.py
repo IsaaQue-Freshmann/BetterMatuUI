@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Callable, List, Tuple
+from typing import Callable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from matu.core import parsers as P  # noqa: E402
 
 CHECKS: List[Tuple[str, str, Callable[[str], bool]]] = [
-    ("题目总表", "task__listtotalvisibletask.html",
+    ("题目总表", "task__listtotaltask.html",
      lambda h: len(P.parse_task_list(h)[0]) > 0 and P.parse_task_list(h)[2] > 1),
     ("题目详情", "task__taskdetail_taskid=4.html",
      lambda h: bool(P.parse_task_detail(h)["description"])),
@@ -38,6 +38,21 @@ CHECKS: List[Tuple[str, str, Callable[[str], bool]]] = [
 ]
 
 
+def resolve(base: Path, filename: str) -> Optional[Path]:
+    """在缓存目录里找这份页面。
+
+    缓存文件名由 URL 生成，带分页参数的页面会多出 `_page=N` 后缀
+    （如 task__liststudenttaskgroup__class.id=641_page=1.html），
+    所以先按原名找，找不到再按前缀找带分页的那份（优先第 1 页）。
+    """
+    exact = base / filename
+    if exact.exists():
+        return exact
+    stem = filename[: -len(".html")]
+    matches = sorted(base.glob(f"{stem}_page=*.html"))
+    return matches[0] if matches else None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="解析器离线自检")
     parser.add_argument("--dir", default=str(Path.home() / ".bettermatu" / "html"))
@@ -50,8 +65,8 @@ def main() -> int:
 
     passed = skipped = failed = 0
     for label, filename, check in CHECKS:
-        path = base / filename
-        if not path.exists():
+        path = resolve(base, filename)
+        if path is None:
             print(f"  跳过  {label:8s} —— 缓存缺失 {filename}")
             skipped += 1
             continue

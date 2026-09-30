@@ -5,7 +5,7 @@
 
 **为什么必须按账号隔离**：站点的页面/接口/字段结构对所有账号是统一的
 （所以 parsers/client/submit 与账号无关），但内容——有哪些班级、哪些作业、
-哪些题目、提交记录——完全属于账号私有。换账号必须重新爬，
+哪些题目、提交记录——完全属于账号私有。换账号必须重新加载，
 旧账号的数据留在它自己的目录里，由设置界面按账号管理。
 
 界面代码通过 workspace.store 拿数据，所以换账号后一次 reload 就能全部切换。
@@ -33,6 +33,7 @@ class Workspace(QObject):
 
     changed = Signal()              # 账号或数据变了，界面要重载
     state_changed = Signal(str)     # logged_in | logged_out | checking
+    session_expired = Signal()      # 会话失效且补登录失败：需要用户重新登录
 
     def __init__(self, config: Config, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -51,6 +52,7 @@ class Workspace(QObject):
         # 本次会话里用过的凭据，**只在内存**，用于会话过期后自动重登
         self._credentials: Optional[Tuple[str, str]] = None
 
+        self.client.relogin_hook = self.relogin
         if config.active_account:
             self._activate(config.active_account, persist=False)
         else:
@@ -80,7 +82,7 @@ class Workspace(QObject):
 
     @property
     def has_data(self) -> bool:
-        """当前账号是否已经爬过数据。"""
+        """当前账号是否已经加载过数据。"""
         if not self.has_account:
             return False
         try:
@@ -95,7 +97,7 @@ class Workspace(QObject):
     # ---------------- 账号切换 ----------------
 
     def _activate(self, username: str, persist: bool = True) -> None:
-        """切到某账号：换库、换会话文件、加载它的 Cookie。"""
+        """切到某账号：换库、换会话文件、读取它的 Cookie。"""
         if username != self._username and not self._store.is_empty_db:
             self._store.close()
         self._username = username
@@ -122,6 +124,8 @@ class Workspace(QObject):
         if ok:
             # 记住凭据（仅内存）：站点的会话可能中途失效，那时要能自动重登
             self._credentials = (username, password)
+            # 让客户端自己会在掉登录时补救：所有请求都受益，不必逐个调用点处理
+            self.client.relogin_hook = self.relogin
             if username != self._username:
                 self._activate(username)
             self._set_logged_in(True)
@@ -138,7 +142,27 @@ class Workspace(QObject):
             return False
         if ok:
             self._set_logged_in(True)
+        else:
+            # 补登录也失败 → 判定"登录状态已过期"，让界面弹告警
+            self._set_logged_in(False)
+            self.session_expired.emit()
         return ok
+
+    def check_session(self) -> bool:
+        """定时探一次登录态；掉了就用内存里的凭据自动补登录。
+
+        站点在会话过期后会把任何页面退回登录页，所以探一个便宜的页面就够。
+        补登录失败才把状态置为未登录，让界面提示用户。
+        """
+        if not self._logged_in:
+            return False
+        try:
+            resp = self.client.get("/page/files/left.jsp")
+        except Exception:                      # 网络问题不该把登录态判死
+            return True
+        if not MatuClient.looks_like_login_page(resp.text):
+            return True
+        return self.relogin()
 
     def ensure_session(self) -> bool:
         """确保会话可用：失效就自动重登。返回是否可用。

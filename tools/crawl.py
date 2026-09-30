@@ -4,7 +4,7 @@
 只读工具：除了登录，全部请求都是 GET。本工具**不构造任何提交请求**，
 也不会碰 upload_assignment_by_* 这类端点。
 
-默认是断点续爬：已经抓过的题目详情/提交详情会跳过，重跑只补缺口，
+默认是断点续传：已经抓过的题目详情/提交详情会跳过，重跑只补缺口，
 所以中断了直接再跑一次就行，不会重复请求。
 
 用法（凭据从环境变量 MATU_USER / MATU_PASS 读取）：
@@ -38,8 +38,6 @@ from matu.core.client import MatuClient  # noqa: E402
 P_TASK_LIST = "/task/listtotaltask?page={page}"
 P_TASK_DETAIL = "/task/taskdetail?taskid={task_id}"
 P_MY_CLASSES = "/course/liststudentclass?page={page}"
-P_CLASS_HOMEWORK = "/task/liststudenttaskgroup?_class.id={class_id}&page={page}"
-P_GROUP_TASKS = "/task/listTaskGroup_Task?taskGroup.id={group_id}"
 P_SUBMISSIONS = "/assignment/listassignment?page={page}"
 P_SCORE_DETAIL = "/assignment/scoredetail?assignmentid={aid}"
 
@@ -148,13 +146,13 @@ def crawl_submissions(client: MatuClient, store: Store, detail_limit=None, refre
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="码图只读爬虫（不会提交任何代码）")
+    parser = argparse.ArgumentParser(description="码图只读加载器（不会提交任何代码）")
     parser.add_argument("what", choices=["classes", "tasks", "details", "homework",
                                          "submissions", "all"])
     parser.add_argument("--account", default="", help="账号名（默认取环境变量 MATU_USER）")
     # 0.5 秒/题：站点的结构对所有账号统一，但内容随账号不同，
-    # 换账号要整份重爬，所以这里比探针阶段放快一些，仍是串行、无并发。
-    parser.add_argument("--interval", type=float, default=0.2, help="请求最小间隔秒数（默认 0.2）")
+    # 换账号要整份重新加载，所以这里比探针阶段放快一些，仍是串行、无并发。
+    parser.add_argument("--interval", type=float, default=0.1, help="请求最小间隔秒数（默认 0.1）")
     parser.add_argument("--jitter", type=float, default=0.05, help="叠加的随机抖动上限（默认 0.05）")
     parser.add_argument("--limit", type=int, default=None, help="详情类请求本run上限")
     parser.add_argument("--refresh", action="store_true", help="忽略断点，重新抓详情")

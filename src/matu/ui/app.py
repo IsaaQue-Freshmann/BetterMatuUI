@@ -138,6 +138,7 @@ class MainWindow(QMainWindow):
         self._ws = workspace
         self._config = config
         self._login_worker: Optional[LoginWorker] = None
+        self._was_busy = False      # 上一拍有没有站点交互在跑（用来抓"刚结束"）
 
         self.setWindowTitle("BetterMatuUI")
         self.resize(1360, 880)
@@ -181,6 +182,15 @@ class MainWindow(QMainWindow):
         self._ws.changed.connect(self._on_account_changed)
         # 加载进度同时显示在「我的班级」底部（两个页面都能看到）
         self._task_center.bank_crawl_state.connect(self._my_class.set_status)
+        self._task_center.bank_crawl_state.connect(self._data_center.set_status)
+        # 任何登录态变化都补一次自检：不依赖单一触发点，
+        # 避免出现「登录后没有自动加载」的情况
+        self._ws.state_changed.connect(self._on_login_state_changed)
+        # 没登录就亮告警，但措辞区分情形：
+        #   会话失效（连补登录都失败）-> 已过期
+        #   用户自己点退出登录         -> 已退出登录
+        self._ws.session_expired.connect(
+            lambda: self._sidebar.set_login_alert(True, "登陆状态已过期"))
 
         QShortcut(QKeySequence("Ctrl+,"), self, self.open_settings)
         QShortcut(QKeySequence("Meta+,"), self, self.open_settings)
@@ -205,6 +215,15 @@ class MainWindow(QMainWindow):
         # 启动自检：上次若没加载完（比如中途关掉程序），这里接着加载
         QTimer.singleShot(600, self._startup_selfcheck)
 
+        # 登录态看护：按设置的间隔（默认 30 分钟）探一次，掉了自动补登录
+        self._session_timer = QTimer(self)
+        self._session_timer.timeout.connect(self._check_session)
+        self._restart_session_timer()
+
+        # 数据中心也能发起更新；更新完成后所有页面一起刷新
+        self._data_center.refresh_requested.connect(self.refresh_everything)
+        self._task_center.data_loaded.connect(self.refresh_everything)
+
     # 账号切换后数据整个换了，做成属性避免拿到旧快照
     @property
     def _store(self):
@@ -214,24 +233,100 @@ class MainWindow(QMainWindow):
     def _session(self):
         return self._ws
 
-    def _refresh_busy(self) -> None:
-        """侧栏那个旋转的加载指示器：有后台动作就转，没有就隐藏。"""
+    def _site_workers(self) -> list:
+        """所有"要跟站点打交道"的后台任务。
+
+        它们的共同点：跑完就可能改动本地库（提交记录、成绩详单、题库、班级…），
+        所以既用来判断"忙不忙"，也用来判断"一次交互刚结束"。
+        """
         workers = [getattr(self, "_login_worker", None),
                    getattr(self._task_center, "_bank_worker", None),
                    getattr(self._my_class, "_submit_worker", None),
-                   getattr(self._my_class, "_refresh_worker", None)]
+                   getattr(self._my_class, "_refresh_worker", None),
+                   # 设置页里那个"为当前账号加载完整题库"
+                   getattr(getattr(self._profile, "_sections", None),
+                           "_bank_worker", None)]
         for page in (self._my_class, self._task_center):
             files = getattr(getattr(page, "_code", None), "_files", None)
             if files is not None:
                 workers += [getattr(files, "_history_worker", None),
                             getattr(files, "_code_worker", None)]
+        return workers
+
+    def _refresh_busy(self) -> None:
+        """侧栏那个旋转的加载指示器：有后台动作就转，没有就隐藏。
+
+        顺便盯着"忙 → 闲"这个拐点：一次与站点的交互刚结束时，本地数据
+        （题库总数、提交记录…）往往已经变了，在这里统一补一次数据中心重算。
+        这样以后新增任何一种交互（提交、回溯、刷新…）都会自动跟上，
+        不必每加一个功能都记得手动接一遍。
+        """
         busy = any(w is not None and getattr(w, "isRunning", lambda: False)()
-                   for w in workers)
+                   for w in self._site_workers())
         self._sidebar.set_busy(busy)
+        if self._was_busy and not busy:
+            self.refresh_data_center()
+        self._was_busy = busy
+
+    def refresh_data_center(self) -> None:
+        """让数据中心按本地库重算一遍（只读本地库，不发请求，很快）。
+
+        数据中心的数字全部来自本地数据，所以凡是"数据可能变了"的时机都该调它：
+        加载完成后（task_center 的 data_loaded 已接）、每次启动、以及每次交互之后。
+        """
+        try:
+            self._data_center.reload()
+        except Exception:      # noqa: BLE001 —— 只是个界面重算，不该把程序带崩
+            pass
+
+    def _restart_session_timer(self) -> None:
+        minutes = max(1, int(self._config.session_check_minutes or 30))
+        self._session_timer.start(minutes * 60 * 1000)
+
+    def _check_session(self) -> None:
+        if not self._ws.logged_in:
+            return
+        ok = self._ws.check_session()
+        if ok:
+            return
+        self._profile.refresh_state()
+        self._task_center.bank_crawl_state.emit(
+            "登录已过期且自动补登录失败，请到「个人中心」重新登录。")
+
+    def refresh_everything(self) -> None:
+        """所有页面的内容一起刷新（加载完成后自动调用，也可手动触发）。"""
+        self._my_class.reload()
+        self._task_center.reload()
+        self.refresh_data_center()
+        self._profile.refresh_state()
+        self._profile.refresh_stats()
+
+    def _on_login_state_changed(self, state: str) -> None:
+        """登录态变了：告警跟着**状态**走，已登录则确保加载一定会被触发。
+
+        告警以前只在"点退出登录"那一个调用点上设置，于是其它同样会掉登录的
+        路径（删缓存、切账号、被动发现会话失效）都是静默的 —— 用户看到的就是
+        "莫名其妙退出了登录，一声不吭"。这里按状态兜底，更具体的措辞
+        （"登陆状态已过期"）由各自的地方覆盖。
+        """
+        if state == "logged_out":
+            self._sidebar.set_login_alert(True, "已退出登录")
+        elif state == "logged_in":
+            # 自动补登录成功也要撤掉告警，否则会留着一个过期的黄标
+            self._sidebar.set_login_alert(False)
+        if state != "logged_in" or not self._ws.has_account:
+            return
+        QTimer.singleShot(200, self._task_center.check_and_resume)
 
     def _startup_selfcheck(self) -> None:
+        # 每次打开软件都让数据中心按本地库重算一遍（会话探活之后）
+        self.refresh_data_center()
         if self._ws.logged_in:
             self._task_center.check_and_resume()
+            self._data_center.fetch_name_if_missing()   # 两个页面都要显示姓名
+        elif self._ws.has_account:
+            # 有账号但会话不可用（比如上次是过期退出的）：直接把告警亮出来
+            self._sidebar.set_login_alert(True, "登陆状态已过期")
 
     def _update_title(self) -> None:
         self.setWindowTitle(f"BetterMatuUI — {self._ws.username}"
@@ -242,7 +337,11 @@ class MainWindow(QMainWindow):
         self._my_class.reload()
         self._profile.refresh_state()
         self._profile.refresh_stats()
-        # 切到的新账号若还没数据，同样自动开爬
+        # 当前账号的缓存刚被删掉：本地已经没这个账号了，得说清是为什么掉的线
+        # （切到另一个账号时 has_account 仍为真，不会走到这里）
+        if not self._ws.has_account:
+            self._sidebar.set_login_alert(True, "缓存已删除，已退出登录")
+        # 切到的新账号若还没数据，同样自动开始加载
         self._task_center.maybe_autocrawl()
 
     # ---- 导航 ----
@@ -266,8 +365,9 @@ class MainWindow(QMainWindow):
 
     def _on_login_done(self, ok: bool, message: str) -> None:
         if ok:
+            self._sidebar.set_login_alert(False)         # 登录成功即撤掉告警
             self._profile.login_succeeded()
-            # 登录成功后若是新账号（库里没数据），自动把该账号的数据爬一遍
+            # 登录成功后若是新账号（库里没数据），自动把该账号的数据加载一遍
             self._task_center.maybe_autocrawl()
             # 姓名还没取过就顺手取一次，这样个人中心和数据中心都能显示
             self._data_center.fetch_name_if_missing()
@@ -276,6 +376,8 @@ class MainWindow(QMainWindow):
         self._sync_submission_gate()
 
     def _on_logout(self) -> None:
+        # 告警不在这里设：logout() 会广播登录态，统一由 _on_login_state_changed
+        # 处理，免得又出现"这条路亮了告警、那条路静悄悄"的老问题
         self._session.logout()
         self._profile.refresh_state()
         self._sync_submission_gate()
@@ -302,6 +404,8 @@ class MainWindow(QMainWindow):
         self._sync_submission_gate()
         self._my_class.reload()
         self._profile.refresh_stats()
+        # 设置页里"加载完整题库""删除缓存"之后，数据中心的题库总数/评级也变了
+        self.refresh_data_center()
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -319,6 +423,11 @@ def main(argv: Optional[list] = None) -> int:
     app.setFont(ui_font())
     app.setStyleSheet(app_qss())
     apply_app_icon(app)
+
+    # 启动声明：必须明确选择，选「退出」（或 Esc / 关窗口）直接结束进程
+    from .disclaimer import ask_for_consent
+    if not ask_for_consent():
+        return 0
 
     # 数据按账号隔离：Workspace 负责"当前是哪个账号、用哪个库、哪份会话"
     workspace = Workspace(config)

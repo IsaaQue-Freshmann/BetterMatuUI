@@ -1,6 +1,6 @@
 """数据中心：个人信息 + 提交热力图 + 三维能力雷达 + 评级 + 提交折线图。
 
-所有数据都来自本地库（题目中心爬下来的提交记录），不发网络请求；
+所有数据都来自本地库（题目中心加载下来的提交记录），不发网络请求；
 只有"取姓名"会联网一次（站点把姓名放在 left.jsp 里），取到后存进库里。
 """
 
@@ -47,6 +47,8 @@ class NameWorker(QThread):
 class DataCenterPage(QWidget):
     """数据中心页面。"""
 
+    refresh_requested = Signal()      # 点刷新：交给主窗口去重新加载数据
+
     def __init__(self, workspace, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         t = theme()
@@ -84,9 +86,18 @@ class DataCenterPage(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         scroll.setWidget(inner)
+
+        # 底部状态条：默认首页也要看得到加载进度，否则登录后像什么都没发生
+        self._status = QLabel("", self)
+        self._status.setFont(ui_font(t.small_font_size))
+        self._status.setContentsMargins(t.metrics.space_lg, 4, t.metrics.space_lg, 4)
+        self._status.setVisible(False)
+
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.addWidget(scroll)
+        root.setSpacing(0)
+        root.addWidget(scroll, 1)
+        root.addWidget(self._status)
 
         self._ws.changed.connect(self.reload)
         self.reload()
@@ -133,6 +144,14 @@ class DataCenterPage(QWidget):
                                       tooltip="姓名可以从站点读到，取一次即缓存")
         self._name_btn.clicked.connect(self.fetch_name)
         cl.addWidget(self._name_btn)
+        # 数据中心的数据全部来自本地库，所以这里只做一次重算，不发请求。
+        # 真正把站点数据拉下来的是「加载」和「提交」，它们结束时会自动重算，
+        # 这个按钮留给"我想手动再算一遍"的场合。
+        self._refresh_btn = VectorButton("更新数据", "refresh", VectorButton.SUBTLE, card,
+                                         tooltip="按本地已加载的数据重算一遍（不发请求），"
+                                                 "所有页面一起刷新；与站点交互结束后会自动刷新")
+        self._refresh_btn.clicked.connect(self.refresh_requested.emit)
+        cl.addWidget(self._refresh_btn)
         return card
 
     # ---------------- 上板块：热力图 ----------------
@@ -326,6 +345,12 @@ class DataCenterPage(QWidget):
         self._name_btn.setVisible(False)
         if name:
             self._name.setText(name)
+
+    def set_status(self, text: str) -> None:
+        """底部状态条（加载进度）。"""
+        self._status.setText(text)
+        self._status.setStyleSheet(f"color:{theme().palette.text_dim};")
+        self._status.setVisible(bool(text))
 
     def apply_theme(self) -> None:
         self.reload()

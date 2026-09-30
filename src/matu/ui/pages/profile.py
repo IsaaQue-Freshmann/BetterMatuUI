@@ -181,7 +181,7 @@ class ProfilePage(QWidget):
         self._actions.setVisible(logged)
 
     def _display_name(self) -> str:
-        """站点上爬到的姓名（存在本地库里；没取过就为空）。"""
+        """站点上加载到的姓名（存在本地库里；没取过就为空）。"""
         try:
             row = self._store.conn.execute(
                 "SELECT value FROM meta WHERE key='display_name'").fetchone()

@@ -90,7 +90,10 @@ class CodeWorker(QThread):
     def run(self) -> None:
         try:
             code, filename = S.fetch_submitted_code(self._ws.client, self._assignment_id)
-            if MatuClient.looks_like_login_page(code):
+            # 两道防线：登录表单/JS 跳转页（会话失效），以及"取回来的是 HTML
+            # 而不是代码"。以前只查第一种，于是登录跳转页被当成源码显示了
+            if (MatuClient.looks_like_login_page(code)
+                    or MatuClient.looks_like_html_not_code(code)):
                 # 取回的是登录页而不是源码 —— 会话掉了。自动重登后重试一次，
                 # 否则会把一段 HTML 当成"源码"打开（这正是之前报的那个错）
                 if not self._ws.ensure_session():
@@ -99,8 +102,10 @@ class CodeWorker(QThread):
                     return
                 code, filename = S.fetch_submitted_code(self._ws.client,
                                                         self._assignment_id)
-                if MatuClient.looks_like_login_page(code):
-                    self.failed.emit("重新登录后仍未取到源码，请稍后再试。")
+                if (MatuClient.looks_like_login_page(code)
+                        or MatuClient.looks_like_html_not_code(code)):
+                    self.failed.emit("重新登录后仍未取到源码（取回的是网页而非代码），"
+                                     "请稍后再试。")
                     return
             self._ws.store.save_submission_code(self._assignment_id, code)
             self.done.emit(self._task_id, self._assignment_id, code, filename)
@@ -214,7 +219,7 @@ class FileListPanel(QWidget):
     # ---------------- 数据 ----------------
 
     def set_task(self, node, store=None) -> None:
-        """切到某道题：先用缓存渲染，再由"点什么爬什么"策略联网校准。
+        """切到某道题：先用缓存渲染，再由"点什么加载什么"策略联网校准。
 
         缓存**只用于离线查看**：已登录时，每打开一道题就把它的提交记录
         重新拉一遍，用站点数据覆盖本地 —— 站点上有新提交或旧记录有变时，
@@ -404,7 +409,9 @@ class FileListPanel(QWidget):
         if not task_id or not assignment_id:
             return
         cached = (self._ws.store.get_submission(assignment_id) or {}).get("code_text") or ""
-        usable_cache = bool(cached.strip()) and not MatuClient.looks_like_login_page(cached)
+        usable_cache = (bool(cached.strip())
+                        and not MatuClient.looks_like_login_page(cached)
+                        and not MatuClient.looks_like_html_not_code(cached))
 
         if not self._ws.logged_in:
             # 离线：只能用缓存

@@ -3,7 +3,8 @@
 界面右上角的"刷新"和 tools/crawl.py 的 homework 阶段共用这一份实现，
 避免出现两套会走偏的代码。
 
-请求量很小：班级列表 1 次 + 每次作业 1 次 + 每个班级的作业列表 1 次。
+请求量很小：班级列表 1 次 + 每个班级的作业列表各 1 次（每页 1 次）
++ 每次作业内的题目列表各 1 次（每页 1 次）。
 """
 
 from __future__ import annotations
@@ -19,16 +20,22 @@ from .store import Store
 
 P_MY_CLASSES = "/course/liststudentclass?page={page}"
 P_CLASS_HOMEWORK = "/task/liststudenttaskgroup?_class.id={class_id}&page={page}"
-P_GROUP_TASKS = "/task/listTaskGroup_Task?taskGroup.id={group_id}"
+P_GROUP_TASKS = "/task/listTaskGroup_Task?taskGroup.id={group_id}&page={page}"
 P_TASK_LIST = "/task/listtotaltask?page={page}"
 P_TASK_DETAIL = "/task/taskdetail?taskid={task_id}"
 P_SUBMISSIONS = "/assignment/listassignment?page={page}"
 P_SCORE_DETAIL = "/assignment/scoredetail?assignmentid={aid}"
 
+# 防呆上限：班级→作业、作业→题目 各自最多翻多少页（每页 10 条）。
+# 正常一个学期的作业不到 20 次、一次作业不到 100 题，撞到上限说明
+# 站点返回的页数不可信，宁可少取也不要无限翻下去。
+MAX_LIST_PAGES = 50
+
 
 def refresh_task_bank(client: MatuClient, store: Store,
                       log: Optional[Callable[[str], None]] = None,
                       progress: Optional[Callable[[int, int, str], None]] = None,
+                      include_details: bool = True,
                       refresh_details: bool = False,
                       limit: Optional[int] = None,
                       should_stop: Optional[Callable[[], bool]] = None,
@@ -36,11 +43,11 @@ def refresh_task_bank(client: MatuClient, store: Store,
     """抓「题目总表」的全部分页 + 每道题的详情。
 
     `题目总表` 是 listtotalvisibletask——**当前账号可见**的题，
-    所以换账号之后必须重爬，不能沿用上一个账号的结果。
+    所以换账号之后必须重新加载，不能沿用上一个账号的结果。
 
     progress(已完成, 总数, 当前项) 供界面显示进度；
-    on_task_saved(task_id) 在每道题落库后回调，界面据此"边爬边往目录里加"；
-    should_stop() 返回 True 时中途安全退出（已抓的部分都落库了，可断点续爬）。
+    on_task_saved(task_id) 在每道题落库后回调，界面据此"边加载边往目录里加"；
+    should_stop() 返回 True 时中途安全退出（已抓的部分都落库了，可断点续传）。
     """
     say = log or (lambda _m: None)
     tick = progress or (lambda _d, _t, _s: None)
@@ -64,6 +71,13 @@ def refresh_task_bank(client: MatuClient, store: Store,
         # 分页阶段也要报进度，否则界面上几十秒看不出在动
         tick(page, total_pages, f"题目列表 第 {page} 页")
         say(f"题目总表 第 {page}/{total_pages} 页，{len(tasks)} 题")
+
+    # include_details=False 才是真的"只抓名称、不抓正文"。
+    # 注意别用 refresh_details=False 表达这个意思 —— 它的语义是"只补还没有
+    # 详情的题"，而列表阶段刚写进去的题全都没有详情，等于把所有题又抓一遍。
+    if not include_details:
+        say("按设置只取题目列表，不抓正文（正文等点开该题时再抓）")
+        return {"pages": total_pages, "details": 0, "total_details": 0}
 
     ids = (store.all_task_ids() if refresh_details else store.pending_detail_ids())
     if limit:
@@ -186,9 +200,11 @@ def refresh_all(client: MatuClient, store: Store,
     if should_stop and should_stop():
         return result
 
-    told("③ 正在加载题库（题数较多）…", 0.66)
+    # 题库只抓"名称/语言/编译类型"这些列表信息，**不抓题目正文**：
+    # 正文等用户点开哪道题再抓哪道，能省掉几百个请求
+    told("③ 正在加载题库列表（只取题目名称）…", 0.66)
     result.update(refresh_task_bank(client, store, log=say, progress=progress,
-                                    refresh_details=True, should_stop=should_stop,
+                                    include_details=False, should_stop=should_stop,
                                     on_task_saved=on_task_saved))
     told("全部加载完成", 1.0)
     return result
@@ -214,15 +230,70 @@ def bank_totals(client: MatuClient, store: Store) -> Tuple[int, int]:
     return cached, (total_pages - 1) * per_page + len(last_tasks)
 
 
+def fetch_task_detail(client: MatuClient, store: Store, task_id: int) -> Dict[str, str]:
+    """抓单道题的正文（"点什么加载什么"用）。
+
+    批量加载只取题目名称，正文等用户点开这道题再抓，一次一个请求。
+    """
+    detail = P.parse_task_detail(client.get(P_TASK_DETAIL.format(task_id=task_id)).text)
+    store.save_task_detail(task_id, detail["description"],
+                           detail["name"], detail["language"])
+    return detail
+
+
 def fetch_profile_name(client: MatuClient) -> str:
     """取账号对应的姓名。
 
     站点把它放在 `left.jsp` 的 `<span class="left-font02">` 里
-    （紧跟"您好，"之后），是爬得到的，不需要用户自己填。
+    （紧跟"您好，"之后），是取得到的，不需要用户自己填。
     """
     soup = BeautifulSoup(client.get("/page/files/left.jsp").text, "lxml")
     span = soup.find("span", class_="left-font02")
     return span.get_text(strip=True) if span is not None else ""
+
+
+def fetch_class_groups(client: MatuClient, class_id: int,
+                       log: Optional[Callable[[str], None]] = None
+                       ) -> List[Dict[str, object]]:
+    """取某个班级的全部作业（TaskGroup）。
+
+    **必须翻页**：这个列表每页 10 条，只取第 1 页的话作业一超过 10 次就漏，
+    站点自己的分页链接形如 `liststudenttaskgroup?page=2&_class.id=641`。
+    """
+    say = log or (lambda _m: None)
+
+    page, total, groups = 1, 1, []
+    while page <= total:
+        if page > MAX_LIST_PAGES:
+            say(f"班级 {class_id} 的作业超过 {MAX_LIST_PAGES} 页，只取了前 {MAX_LIST_PAGES} 页")
+            break
+        html = client.get(P_CLASS_HOMEWORK.format(class_id=class_id, page=page)).text
+        groups += P.parse_homework_groups(html)
+        total = max(total, P.parse_pager(html)[1])
+        page += 1
+    return groups
+
+
+def fetch_group_tasks(client: MatuClient, group_id: int,
+                      log: Optional[Callable[[str], None]] = None
+                      ) -> List[Dict[str, object]]:
+    """取某次作业内的全部题目。
+
+    同样**必须翻页**（每页 10 条，题目超过 10 道就会漏），
+    站点分页链接形如 `listTaskGroup_Task?page=2&taskGroup.id=8878`。
+    """
+    say = log or (lambda _m: None)
+
+    page, total, items = 1, 1, []
+    while page <= total:
+        if page > MAX_LIST_PAGES:
+            say(f"作业 {group_id} 的题目超过 {MAX_LIST_PAGES} 页，只取了前 {MAX_LIST_PAGES} 页")
+            break
+        html = client.get(P_GROUP_TASKS.format(group_id=group_id, page=page)).text
+        items += P.parse_homework_tasks(html, group_id)
+        total = max(total, P.parse_pager(html)[1])
+        page += 1
+    return items
 
 
 def refresh_class_data(client: MatuClient, store: Store,
@@ -241,16 +312,14 @@ def refresh_class_data(client: MatuClient, store: Store,
     group_total = task_total = 0
     for cls in classes:
         class_id = int(cls["class_id"])
-        groups = P.parse_homework_groups(
-            client.get(P_CLASS_HOMEWORK.format(class_id=class_id, page=1)).text)
+        groups = fetch_class_groups(client, class_id, log=say)
         store.save_homework_groups(groups, class_id)
         group_total += len(groups)
         say(f"{cls.get('course','')} / {cls.get('name','')}：{len(groups)} 次作业")
 
         for g in groups:
             gid = int(g["task_group_id"])
-            items = P.parse_homework_tasks(
-                client.get(P_GROUP_TASKS.format(group_id=gid)).text, gid)
+            items = fetch_group_tasks(client, gid, log=say)
             for it in items:
                 it["class_id"] = class_id
                 it["group_name"] = g.get("name", "")

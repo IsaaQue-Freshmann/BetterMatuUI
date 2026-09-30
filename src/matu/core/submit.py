@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -55,15 +56,38 @@ def fetch_submitted_code(client: MatuClient, assignment_id: int) -> Tuple[str, s
     return resp.content.decode("utf-8", errors="replace"), filename
 
 
-def fetch_task_submissions(client: MatuClient, task_id: int) -> Tuple[List[Submission], str]:
-    """拉某道题的全部提交记录（对应网站「题目中心 / 作业状态」按题筛）。
+MAX_SUBMISSION_PAGES = 20      # 防呆上限：一道题的提交记录页数
 
-    同时返回原始 HTML：会话失效时站点会把任何页面退回登录页，
-    调用方需要靠它判断"拿到的其实是登录页"。
+
+def fetch_task_submissions(client: MatuClient, task_id: int,
+                           pages: Optional[str] = "all"
+                           ) -> Tuple[List[Submission], str]:
+    """拉某道题的提交记录（对应网站「题目中心 / 作业状态」按题筛）。
+
+    **必须翻页**：这个列表按时间升序，每页 10 条，第 1 页永远是最早的记录。
+    以前只取第 1 页，于是提交数一超过 10 条，新记录就"查不到"了 ——
+    提交成功却说"站点没返回数据"、文件列表也缺记录，根子都在这里。
+
+    pages="all" 取全部；pages="last" 只取最后一页（找最新记录时最省）。
+    同时返回第一页的原始 HTML，供调用方判断会话是否失效。
     """
-    html = client.get(LIST_BY_TASK.format(task_id=task_id)).text
-    subs = [s for s in P.parse_submissions(html) if s.task_id == task_id]
-    return subs, html
+    first_url = LIST_BY_TASK.format(task_id=task_id)
+    first = client.get(first_url)
+    html = first.text
+    total = max(1, P.parse_pager(html)[1])
+
+    collected = [s for s in P.parse_submissions(html) if s.task_id == task_id]
+    if pages == "last" and total > 1:
+        collected = []
+        page_range = [total]
+    else:
+        page_range = range(2, min(total, MAX_SUBMISSION_PAGES) + 1)
+
+    for page in page_range:
+        page_html = client.get(f"{first_url}&page={page}").text
+        collected += [s for s in P.parse_submissions(page_html)
+                      if s.task_id == task_id]
+    return collected, html
 
 
 def parse_deduction(detail_text: str) -> Optional[int]:
@@ -98,6 +122,16 @@ class SubmitOutcome:
 
     @property
     def score(self) -> Optional[int]:
+        """得分。
+
+        **以成绩详单里的扣分为准**（得分 = 100 - 扣分）：提交刚结束时，
+        列表页那一栏的分数可能还是 0（判题结果写库比列表刷新早不了多少），
+        按列表读就会把 75 分显示成 0 分，用户得手动刷新几次才对 —— 这里
+        直接用详单里的扣分反推，一次就准。
+        """
+        deduction = self.deduction
+        if deduction is not None:
+            return max(0, 100 - deduction)
         if self.submission and self.submission.score is not None:
             return self.submission.score
         return None
@@ -164,6 +198,14 @@ def submit_source(
                        allow_redirects=False)
     chain.append((resp.url, resp.status_code))
 
+    # 如果 POST 拿回来的是登录页，说明请求在会话失效的状态下被退回，**这一次
+    # 根本没提交**（不是"提交了但没记录"）。补登录后重试一次是安全的。
+    if client.relogin_hook is not None and client.looks_like_login_page(resp.text):
+        if client.relogin_hook():
+            resp = client.post(UPLOAD_COPY_PASTE, data=payload, referer=page_url,
+                               allow_redirects=False)
+            chain.append((resp.url, resp.status_code))
+
     # 跟随跳转时**一律改用 GET**（浏览器的行为也是把 302/303 转成 GET）。
     # 绝不对跳转目标再发一次 POST —— 那会变成意外重复提交。
     hops = 0
@@ -206,15 +248,46 @@ def submit_source(
     )
 
 
+MAX_RESULT_AGE_SECONDS = 1800      # 只接受最近半小时内的记录作为"本次结果"
+
+# 站点在提交记录的状态列上给的标记：
+#   test  = 已生成记录但还没判完（此时分数列是 0、成绩详单是空的）
+#   score = 已经判完，分数与扣分是最终值
+JUDGED_STATUS = "score"
+JUDGE_POLL_INTERVAL = 2.0          # 等待判题时的轮询间隔
+JUDGE_TIMEOUT = 120.0              # 总等待上限（秒）
+
+
+def is_judged(sub: Submission) -> bool:
+    """这条记录判完了没有。"""
+    return (sub.status or "").strip().lower() == JUDGED_STATUS
+
+
+def _submitted_recently(when: str, max_age: int = MAX_RESULT_AGE_SECONDS) -> bool:
+    """提交时间是不是足够新。
+
+    这是防"假结果"的关键：如果本次提交其实没成功（站点没记录），
+    仅凭 assignment_id 比基线大，可能会把站点上**别的**记录当成这次的结果，
+    于是界面显示一个 0 分，但站点上根本没有这条提交。
+    """
+    try:
+        stamp = datetime.strptime((when or "")[:19], "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return True                    # 解析不了就不拦，交给 assignment_id 判断
+    return abs((datetime.now() - stamp).total_seconds()) <= max_age
+
+
 def find_submission(client: MatuClient, task_id: int,
                     after_assignment_id: int = 0) -> Optional[Submission]:
-    """在"作业状态"里找这道题最新的一条提交记录。
+    """在"作业状态"里找这道题**本次**新增的那条提交记录。
 
-    按 assignment_id 最大值取最新，不会把历史记录误当成这次的结果。
+    两个条件同时满足才算：assignment_id 比基线大，且提交时间是最近的。
     """
-    html = client.get(LIST_BY_TASK.format(task_id=task_id)).text
-    subs = [s for s in P.parse_submissions(html) if s.task_id == task_id]
-    fresh = [s for s in subs if s.assignment_id > after_assignment_id]
+    # 只看最后一页：列表按时间升序，最新的记录一定在末页
+    subs, _html = fetch_task_submissions(client, task_id, pages="last")
+    fresh = [s for s in subs
+             if s.assignment_id > after_assignment_id
+             and _submitted_recently(s.submitted_at)]
     if not fresh:
         return None
     return max(fresh, key=lambda s: s.assignment_id)
@@ -233,13 +306,20 @@ def submit_and_collect(
     task_group_task_id: Optional[int] = None,
     task_group_id: Optional[int] = None,
     known_latest_assignment_id: int = 0,
-    result_attempts: int = 3,
-    result_interval: float = 3.0,
+    result_attempts: Optional[int] = None,      # 兼容旧调用，已由超时替代
+    result_interval: float = JUDGE_POLL_INTERVAL,
+    on_progress=None,
 ) -> SubmitOutcome:
-    """提交一次并拉取结果。
+    """提交一次，并**等到站点真的判完**再返回。
 
-    结果拉取做**有限次**尝试（默认最多 3 次、间隔 3 秒），因为站点评测可能不是
-    同步完成的；但绝不做定时轮询——拉不到就如实告诉用户"结果还没出来"。
+    关键在"判完"的判定：站点的提交记录有个状态列 ——
+        test  = 记录已生成，但还没判（分数列 0、成绩详单为空）
+        score = 判完了，分数与扣分是最终值
+    以前只看"有没有新记录"，拿到一条 test 状态的记录就当结果报出去，
+    于是界面显示 0 分，用户得刷新两三次才看到真实的 90 分。
+
+    现在按**状态**等，不看固定时间：一直轮询到状态变成 score，或者等满
+    JUDGE_TIMEOUT 秒。等待期间通过 on_progress 汇报进度，界面显示"判题中"。
     """
     outcome = submit_source(
         client,
@@ -252,14 +332,39 @@ def submit_and_collect(
     if not outcome.ok:
         return outcome
 
-    for attempt in range(result_attempts):
-        found = find_submission(client, task_id, after_assignment_id=known_latest_assignment_id)
+    report = on_progress or (lambda _m: None)
+    deadline = time.monotonic() + JUDGE_TIMEOUT
+    saw_record = False
+    while True:
+        found = find_submission(client, task_id,
+                                after_assignment_id=known_latest_assignment_id)
         if found is not None:
+            saw_record = True
             outcome.submission = found
-            outcome.score_detail = fetch_score_detail(client, found.assignment_id)
-            return outcome
-        if attempt < result_attempts - 1:
-            time.sleep(result_interval)
+            if is_judged(found):
+                # 判完了：详单是权威值（得分 = 100 - 扣分）
+                outcome.score_detail = fetch_score_detail(client, found.assignment_id)
+                return outcome
+            report("站点已收到提交，正在判题…")
+        else:
+            report("等待站点生成提交记录…")
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(result_interval)
 
-    outcome.message = "提交已完成，但站点暂未返回评测结果，请稍后手动刷新。"
+    if saw_record:
+        outcome.message = (f"站点已收到提交，但等待 {int(JUDGE_TIMEOUT)} 秒仍未判完。"
+                           f"点「刷新历史」可以随时查看最新结果。")
+    else:
+        outcome.message = (
+            "站点返回了「上传成功」，但没有生成提交记录 —— "
+            "通常是站点的判题服务繁忙或丢单，请稍后重试。你的代码还在编辑器里。")
+    return outcome
+
+    # 站点回了「上传成功」却没生成记录 —— 实测会遇到（判题服务繁忙时会丢单）。
+    # 这时候绝不能报一个分数出来：既不能拿旧记录冒充本次结果，也不该说"已完成"。
+    # 如实告知，让用户稍后重试（代码还在编辑器里，不会丢）。
+    outcome.message = (
+        "站点返回了「上传成功」，但没有生成提交记录 —— "
+        "通常是站点的判题服务繁忙或丢单，请稍后重试。你的代码还在编辑器里。")
     return outcome

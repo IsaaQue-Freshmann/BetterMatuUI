@@ -7,7 +7,7 @@
    即使将来要给 App 加提交功能，也必须同时改 POST_ALLOWLIST 和
    ENABLE_SUBMISSION 两个开关，不可能"顺手"发出去一个提交。
 2. 不做高频请求。请求严格串行（无线程/无并发），每次请求之间有间隔下限，
-   并叠加随机抖动；单次运行还有请求总数上限，防止循环写错变成爬崩站点。
+   并叠加随机抖动；单次运行还有请求总数上限，防止循环写错把站点刷爆。
 
 会话 Cookie 与原始 HTML 缓存都存放在项目之外的应用数据目录（~/.bettermatu/），
 项目内不落任何由本账号派生的文件。
@@ -89,6 +89,9 @@ class MatuClient:
         self.allow_submission = allow_submission or env_submission_enabled()
         # 会话文件按账号走：每个账号一份 Cookie，互不覆盖
         self.session_file = Path(session_file) if session_file else SESSION_FILE
+        # 掉登录时的补救回调，由上层（Workspace）装上：返回 True 表示重登成功。
+        # 装上之后**每个 GET 都会自动检查登录态**，掉了就重登并重试一次。
+        self.relogin_hook = None
 
         self.request_count = 0
         self.history = []
@@ -199,6 +202,24 @@ class MatuClient:
         finally:
             self._last_request_at = time.monotonic()
 
+        # 每次交互都检查登录态：站点在会话过期后会把任何页面退回登录页，
+        # 于是"取提交列表"这种请求会静默返回空，让人以为"站点没返回数据"。
+        # 这里发现是登录页就补登录并重试一次（只重试一次，绝不无限循环）。
+        if (method == "GET" and self.relogin_hook is not None
+                and not path.startswith("/user/")
+                and self.looks_like_login_page(resp.text)):
+            if self.logger:
+                self.logger(f"检测到登录已失效，正在自动补登录：{url}")
+            if self.relogin_hook():
+                self._throttle()
+                try:
+                    resp = self.session.request(
+                        method, url, params=params, data=data, headers=headers,
+                        timeout=20, allow_redirects=allow_redirects,
+                    )
+                finally:
+                    self._last_request_at = time.monotonic()
+
         self.request_count += 1
         # 站点有的页面不带 charset，requests 会猜成 ISO-8859-1 导致中文乱码。
         if resp.encoding is None or resp.encoding.lower() in ("iso-8859-1", "latin-1"):
@@ -278,5 +299,33 @@ class MatuClient:
 
     @staticmethod
     def looks_like_login_page(html: str) -> bool:
-        """会话失效时站点会把任何页面退回登录表单，用它来判断需要重新登录。"""
-        return 'id="dologin"' in html or "user.Password" in html
+        """会话失效时站点会用两种方式把用户退回登录：
+
+        1. 直接返回带登录表单的页面（`id="dologin"`）；
+        2. 返回一小段 JS 跳转页，内容是
+           `window.top.location.href=".../user/login.action"`。
+
+        第 2 种以前没被识别，于是那段 HTML 被当成"源码"缓存下来并显示在编辑器里
+        —— 这就是"溯源的代码不对"的真正原因。
+        """
+        if not html:
+            return False
+        if 'id="dologin"' in html or "user.Password" in html:
+            return True
+        low = html.lower()
+        return "user/login.action" in low and (
+            "location.href" in low or "window.top" in low or "window.location" in low)
+
+    @staticmethod
+    def looks_like_html_not_code(text: str) -> bool:
+        """判断"取回的源码"其实是 HTML 页面而不是代码。
+
+        源码以 `<` 开头的概率极低，而登录页/错误页一定是 HTML，所以用这个
+        做最后一道防线：宁可报错让用户重试，也不能把一段 HTML 当成代码打开。
+        """
+        stripped = (text or "").lstrip()
+        if not stripped:
+            return False
+        head = stripped[:200].lower()
+        return head.startswith(("<html", "<!doctype", "<?xml", "<script")) or \
+            ("<html" in head and "<body" in stripped[:1000].lower())

@@ -576,10 +576,15 @@ class StatementStrip(Card):
 # ----------------------------------------------------------------- 提交线程
 
 class SubmitWorker(QThread):
-    """后台提交，避免界面卡住（站点评测是同步的，实测约 3.7 秒）。"""
+    """后台提交：提交后**等到站点判完**再回来。
+
+    站点的提交记录有状态列：test=还没判完、score=已判完。以前拿到一条 test
+    状态的记录就当结果报出去，界面显示 0 分、刷新几次才变对。现在按状态等。
+    """
 
     succeeded = Signal(object)
     failed = Signal(str)
+    progress = Signal(str)          # 判题进度文案
 
     def __init__(self, session, node: Node, source: str) -> None:
         super().__init__()
@@ -590,14 +595,13 @@ class SubmitWorker(QThread):
     def run(self) -> None:
         try:
             client = self._session.client
-            # 先记基线：这道题当前最大的 assignment_id
+            # 基线从**本地库**取，不发请求：以前这里联网取、失败就退化成 0，
+            # 于是"这次其实没提交成功"时会把站点上的旧记录当成本次结果，
+            # 界面上就出现了一个 0 分（但站点上根本没有这条提交）
             try:
-                existing = P.parse_submissions(
-                    client.get(S.LIST_BY_TASK.format(task_id=self._node.task_id)).text)
-                baseline = max(
-                    (s.assignment_id for s in existing if s.task_id == self._node.task_id),
-                    default=0)
-            except Exception:
+                rows = self._session.store.get_submissions(self._node.task_id, limit=1)
+                baseline = int(rows[0]["assignment_id"]) if rows else 0
+            except Exception:                     # noqa: BLE001
                 baseline = 0
 
             outcome = S.submit_and_collect(
@@ -608,8 +612,7 @@ class SubmitWorker(QThread):
                 task_group_task_id=self._node.task_group_task_id or None,
                 task_group_id=self._node.task_group_id or None,
                 known_latest_assignment_id=baseline,
-                result_attempts=3,
-                result_interval=3.0,
+                on_progress=lambda m: self.progress.emit(m),
             )
             # 落库：这样底部"文件列表"能立刻多出一条历史提交，
             # 不必再点一次"刷新历史"
@@ -621,6 +624,26 @@ class SubmitWorker(QThread):
                 except Exception:                 # noqa: BLE001
                     pass
             self.succeeded.emit(outcome)
+        except Exception as exc:                      # noqa: BLE001
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
+class DetailWorker(QThread):
+    """点开题目时抓这道题的正文（批量加载只取了名称）。"""
+
+    done = Signal(int, str)          # task_id, description
+    failed = Signal(str)
+
+    def __init__(self, workspace, task_id: int) -> None:
+        super().__init__()
+        self._ws = workspace
+        self._task_id = task_id
+
+    def run(self) -> None:
+        from ...core import refresh as R
+        try:
+            detail = R.fetch_task_detail(self._ws.client, self._ws.store, self._task_id)
+            self.done.emit(self._task_id, detail["description"])
         except Exception as exc:                      # noqa: BLE001
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
@@ -812,7 +835,8 @@ class CodeArea(QWidget):
         self._active_submission_id: Optional[int] = None
         self._readonly_mode = False
         self._skeleton = ""
-        self._allowed_total: Optional[int] = None   # 该题允许的提交总次数
+        self._allowed_total: Optional[int] = None    # 该题允许的提交总次数
+        self._remaining_left: Optional[int] = None   # 还能提交几次（总次数 - 已提交）
 
         # --- 工具栏 ---
         self._title = QLabel("", self)
@@ -1069,6 +1093,7 @@ class CodeArea(QWidget):
             # 站点没给这道题的允许次数（也不在任何作业里）：清掉徽章，
             # 否则会留着上一道题的"剩 N 次"
             self._allowed_total = None
+            self._remaining_left = None
             self._badges[2].set_text("")
             self._badges[2].hide()
         for badge, (text, tone) in zip(self._badges, badges):
@@ -1080,6 +1105,9 @@ class CodeArea(QWidget):
                                        COMPILE_SHORT.get(compile_type, compile_type)])
         self._apply_statement_height(self._auto_statement_height(description))
         self._skeleton = extract_code_skeleton(description)
+        # 正文还没抓过（批量加载只取名称）——点开这道题就抓这一道，一次一个请求
+        if not description.strip() and self._session.logged_in and node.task_id:
+            self._fetch_detail(node.task_id)
 
         # 进入工作区：续写最近的未提交文件；一个都没有就新建（新进入）
         self._files.set_task(node, store)
@@ -1101,10 +1129,33 @@ class CodeArea(QWidget):
         except Exception:                     # noqa: BLE001
             used = 0
         left = max(0, self._allowed_total - used)
+        self._remaining_left = left          # 确认框要用同一个值
         badge = self._badges[2]
         badge.set_text(f"剩 {left} 次", "danger" if left <= 5 else "neutral")
         badge.show()
         self._adapt_to_width()
+
+    def _fetch_detail(self, task_id: int) -> None:
+        self._detail_worker = DetailWorker(self._session, task_id)
+        self._detail_worker.done.connect(self._on_detail_loaded)
+        self._detail_worker.start()
+
+    def _on_detail_loaded(self, task_id: int, description: str) -> None:
+        """正文到了：更新题面。只在还停留在同一道题时才写界面。"""
+        if self._node is None or self._node.task_id != task_id:
+            return
+        node = self._node
+        compile_type = node.extra.get("compile_type", "")
+        self._statement.set_statement(node.label, description,
+                                      [node.meta or node.extra.get("language", ""),
+                                       COMPILE_SHORT.get(compile_type, compile_type)])
+        self._skeleton = extract_code_skeleton(description)
+        self._apply_statement_height(self._auto_statement_height(description))
+        self._import_btn.setVisible((not self._readonly_mode) and bool(self._skeleton))
+
+    def open_submission(self, assignment_id: int) -> None:
+        """从外部打开一条历史记录（「作业状态」点进来时用）。"""
+        self._files.open_submission(assignment_id)
 
     def _show_draft_result(self) -> None:
         """本地文件是"未提交"状态：主位显示未提交，历史最高分退到小字。"""
@@ -1123,6 +1174,11 @@ class CodeArea(QWidget):
         """
         self._save_timer.stop()
         draft = self._session.store.get_draft(draft_id) or {}
+        # 防御：文件必须属于当前题目。否则一旦 id 对错，就会出现
+        # "B 题目的新文件里残留 A 题内容"这种串内容
+        if draft and self._node is not None and \
+                int(draft.get("task_id") or 0) != int(self._node.task_id):
+            return
         self._active_draft_id = draft_id
         self._active_submission_id = None
         self._set_readonly(False)
@@ -1142,6 +1198,11 @@ class CodeArea(QWidget):
         if node is None:
             return
         self._save_timer.stop()
+        # 静默清空：新建文件时先把编辑器清干净（不触发保存计时器），
+        # 免得上一道题的内容被这一次的 set_text 带进来
+        self._editor.blockSignals(True)
+        self._editor.set_text("")
+        self._editor.blockSignals(False)
         draft_id = self._session.store.create_draft(
             node.task_id, code=code,
             task_group_task_id=node.task_group_task_id or 0,
@@ -1229,8 +1290,9 @@ class CodeArea(QWidget):
                 "当前未登录。请到「个人中心」登录后再提交（本地题库不需登录就能看）。")
             return
         if not self._always_submit:
-            dlg = ConfirmSubmitDialog(self._node.label,
-                                      self._node.extra.get("max_submissions"), self)
+            # 用算好的"剩余次数"，不是站点给的"允许总次数"（那是 100，
+            # 不管你已经交了几次都显示 100）
+            dlg = ConfirmSubmitDialog(self._node.label, self._remaining_left, self)
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
             if dlg.remember.isChecked():
@@ -1375,6 +1437,7 @@ class MyClassPage(QWidget):
             return
         self._code.set_submitting()
         self._submit_worker = SubmitWorker(self._session, self._code._node, source)  # noqa: SLF001
+        self._submit_worker.progress.connect(self._code._result.set_submitting)
         self._submit_worker.succeeded.connect(self._on_submitted)
         self._submit_worker.failed.connect(self._code.show_error)
         self._submit_worker.start()

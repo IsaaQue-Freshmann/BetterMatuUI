@@ -1,27 +1,24 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""macOS 打包配置。
+"""Windows 打包配置：单文件免安装 exe。
 
-用法（在项目根目录）：
-    .venv/bin/pyinstaller --distpath output/mac/build --workpath output/mac/work \
-        mac/BetterMatuUI.spec
+产物：build/BetterMatuUI.exe —— 一个文件，双击即用，不写注册表、不装任何东西。
 
 两个容易踩的点：
-- 入口用 mac/launcher.py 而不是 src/matu/ui/app.py：后者是包内模块，用相对
-  导入，直接当脚本跑会因缺少包上下文失败。
-- datas 里的 resources 不能省：内置的帮助文档和运行期图标要一起进包。
+- 入口用 win/launcher.py 而不是 src/matu/ui/app.py：后者是包内模块，
+  用相对导入，直接当脚本跑会因缺少包上下文失败。
+- datas 里的 resources 不能省：内置帮助文档和运行期图标要一起进 exe，
+  否则打包后「系统帮助」是空的、图标也会丢。
 """
 
 from pathlib import Path
 
-ROOT = Path(SPECPATH).resolve().parents[0]      # SPECPATH = 本文件所在目录(mac/)，上一级是项目根
+ROOT = Path(SPECPATH).resolve().parents[0]        # SPECPATH = win/，上一级是项目根
 SRC = ROOT / "src"
-ICON = ROOT / "mac" / "BetterMatuUI.icns"
-
-APP_NAME = "BetterMatuUI"
-DISPLAY_NAME = "BetterMatuUI Beta 1.2"
+ICON = ROOT / "win" / "icon.ico"
+VERSION_FILE = ROOT / "win" / "version_info.txt"
 
 a = Analysis(
-    [str(ROOT / "mac" / "launcher.py")],
+    [str(ROOT / "win" / "launcher.py")],
     pathex=[str(SRC)],
     binaries=[],
     datas=[(str(SRC / "matu" / "resources"), "matu/resources")],
@@ -29,7 +26,7 @@ a = Analysis(
     hookspath=[],
     runtime_hooks=[],
     # 界面只用到 QtCore/QtGui/QtWidgets/QtSvg，其余重型模块一律排除，
-    # 否则包体里会塞进 WebEngine、3D、多媒体这些根本没用的东西
+    # 否则 exe 会塞进 WebEngine、3D、多媒体这些根本用不到的东西
     excludes=[
         "tkinter", "unittest", "pydoc_data", "test",
         "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets",
@@ -52,50 +49,24 @@ a = Analysis(
 
 pyz = PYZ(a.pure)
 
+# 单文件模式：binaries 与 datas 直接进 EXE，不再 COLLECT 成目录
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
-    name=APP_NAME,
+    name="BetterMatuUI",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=False,
-    console=False,              # 不弹终端窗口
+    upx=False,                     # upx 压缩容易被杀软误报，关掉
+    console=False,                 # 不弹黑色控制台窗口
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
     icon=str(ICON),
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    name=APP_NAME,
-)
-
-app = BUNDLE(
-    coll,
-    name=f"{APP_NAME}.app",
-    icon=str(ICON),
-    bundle_identifier="com.bettermatu.ui",
-    info_plist={
-        "CFBundleName": APP_NAME,
-        "CFBundleDisplayName": DISPLAY_NAME,
-        "CFBundleShortVersionString": "1.2",
-        "CFBundleVersion": "1.2",
-        "CFBundleGetInfoString": DISPLAY_NAME,
-        "CFBundleExecutable": APP_NAME,
-        "NSHighResolutionCapable": True,          # Retina 下不发虚
-        "LSMinimumSystemVersion": "13.0",
-        "LSApplicationCategoryType": "public.app-category.developer-tools",
-        "NSHumanReadableCopyright": "Created by IsaaQue Freshmann SCU",
-    },
+    version=str(VERSION_FILE),
 )

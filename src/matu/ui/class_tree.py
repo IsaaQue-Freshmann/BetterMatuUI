@@ -64,7 +64,7 @@ def _short_weight(weight) -> str:
 def build_class_tree(store: Store) -> Node:
     """从本地库构建「我的班级」树。
 
-    只用已经爬下来的数据，不发任何网络请求 —— 界面启动即可秒开。
+    只用已经加载下来的数据，不发任何网络请求 —— 界面启动即可秒开。
     """
     root = Node(kind="root", label="我的班级")
     section = Node(kind="section", label="作业列表")

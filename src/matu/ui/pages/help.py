@@ -2,7 +2,7 @@
 
 两份文档（学生手册、学生提交注意事项）是**站点的静态内容，对所有账号一样**，
 所以直接内置在项目里（`src/matu/resources/help/`），
-既不占账号缓存，也不需要每个账号各爬一遍。
+既不占账号缓存，也不需要每个账号各加载一遍。
 
 内容更新时用 `tools/build_help_docs.py` 重新生成。
 """
@@ -29,11 +29,23 @@ from .my_class import BrowserPanel
 HELP_DIR = Path(__file__).resolve().parents[2] / "resources" / "help"
 
 
+def _in_table_body(out: list) -> bool:
+    """当前正在输出的表格是否已经写过表头行（决定用 th 还是 td）。"""
+    for line in reversed(out):
+        if line.startswith("<tr>"):
+            return "<th>" not in line
+        if line.startswith("<table"):
+            return False
+    return False
+
+
 def _inline(text: str) -> str:
-    """行内标记：**粗体** 与 `代码`。先转义再做标记，避免注入。"""
+    """行内标记：**粗体**、`代码`、[文字](链接)。先转义再做标记，避免注入。"""
     text = htmllib.escape(text)
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"`(.+?)`", r"<code>\1</code>", text)
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)",
+                  r'<a href="\2">\1</a>', text)
     return text
 
 
@@ -50,7 +62,20 @@ def md_to_html(text: str) -> str:
     in_code = False
     in_list = False
 
+    def close_table() -> None:
+        if out and out[-1].startswith("<tr>"):
+            # 表格结束：把最后一段 <tr> 包进 <table>
+            rows = []
+            while out and out[-1].startswith("<tr>"):
+                rows.append(out.pop())
+            if out and out[-1].startswith("<table"):
+                out.pop()
+            out.append("<table border=0 cellspacing=0 cellpadding=4>")
+            out.extend(reversed(rows))
+            out.append("</table>")
+
     def flush_para() -> None:
+        close_table()
         if para:
             out.append("<p>" + " ".join(para) + "</p>")
             para.clear()
@@ -92,6 +117,26 @@ def md_to_html(text: str) -> str:
             close_list()
             out.append(f"<blockquote>{_inline(stripped[2:])}</blockquote>")
             continue
+        # 表格：连续的 | ... | 行。第二行是分隔行（|---|---|），丢掉
+        if stripped.startswith("|") and stripped.endswith("|"):
+            flush_para()
+            close_list()
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            if all(set(c) <= set("-: ") and c for c in cells):
+                continue                      # 表头下的分隔行
+            if not out or not out[-1].startswith("<table"):
+                out.append("<table border=0 cellspacing=0 cellpadding=4>")
+            tag = "th" if not _in_table_body(out) else "td"
+            out.append("<tr>" + "".join(f"<{tag}>{_inline(c)}</{tag}>" for c in cells)
+                       + "</tr>")
+            continue
+
+        if stripped in ("---", "***", "___"):
+            flush_para()
+            close_list()
+            out.append("<hr/>")
+            continue
+
         if stripped.startswith("- "):
             flush_para()
             if not in_list:
@@ -158,6 +203,12 @@ class MarkdownView(QTextBrowser):
             }}
             blockquote {{ color: {pal.text_muted}; }}
             a {{ color: {pal.accent}; }}
+            table {{ border-collapse: collapse; }}
+            th {{ color: {pal.text_dim}; border-bottom: 1px solid {pal.border};
+                  padding: 4px 10px; text-align: left; }}
+            td {{ color: {pal.text}; border-bottom: 1px solid {pal.border};
+                  padding: 4px 10px; }}
+            hr {{ color: {pal.border}; }}
         """
 
     def apply_theme(self) -> None:

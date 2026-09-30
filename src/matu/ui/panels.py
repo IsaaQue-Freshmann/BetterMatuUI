@@ -235,9 +235,10 @@ class ResultPanel(Card):
         self._update_min_height()
         self.update()
 
-    def set_submitting(self) -> None:
+    def set_submitting(self, message: Optional[str] = None) -> None:
         self._state = "submitting"
-        self._message = "正在提交并等待站点评测（实测约 3～4 秒）…"
+        self._message = message or "正在提交…"
+        self._timer.start() if not self._timer.isActive() else None
         self._spin = 0
         self._badge.hide()
         self._timer.start()

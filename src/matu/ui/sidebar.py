@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
-from PySide6.QtCore import (QEasingCurve, QPoint, QRect, QRectF, Qt, QTimer,
+from PySide6.QtCore import (QEasingCurve, QPoint, QPointF, QRect, QRectF, Qt, QTimer,
                             QVariantAnimation, Signal)
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QSizePolicy, QWidget
@@ -41,6 +41,7 @@ class NavButton(QWidget):
         self.icon_name = icon
         self._selected = False
         self._hover = False
+        self._alert = False      # 告警：图标右上角黄色带圈感叹号
         self._progress = 1.0     # 展开程度：1 完全展开，0 完全折叠
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
@@ -50,6 +51,11 @@ class NavButton(QWidget):
     def set_selected(self, value: bool) -> None:
         if self._selected != value:
             self._selected = value
+            self.update()
+
+    def set_alert(self, alert: bool) -> None:
+        if alert != self._alert:
+            self._alert = alert
             self.update()
 
     def set_progress(self, value: float) -> None:
@@ -97,6 +103,21 @@ class NavButton(QWidget):
         icons.render(p, self.icon_name,
                      QRect(int(icon_x), int(icon_y), t.metrics.icon, t.metrics.icon),
                      color, 1.9)
+
+        # 告警：图标右上角的黄色带圈感叹号
+        if self._alert:
+            rad = t.metrics.icon / 2 + 1
+            cx, cy = icon_x + t.metrics.icon - 2, icon_y - 1
+            p.setBrush(QColor(pal.warning))
+            p.setPen(QPen(QColor(pal.sidebar), 2))     # 描边把图标"挖"出来
+            p.drawEllipse(QPointF(cx, cy), rad, rad)
+            p.setPen(QPen(QColor(pal.bg), 1.8))
+            f = QFont()
+            f.setPixelSize(int(rad * 1.5))
+            f.setBold(True)
+            p.setFont(f)
+            p.drawText(QRectF(cx - rad, cy - rad, rad * 2, rad * 2),
+                       Qt.AlignmentFlag.AlignCenter, "!")
 
         # 文字随展开程度淡出并右移一点点
         if self._progress > 0.02:
@@ -190,6 +211,7 @@ class Sidebar(QWidget):
             self._buttons.append(btn)
 
         self._busy = BusyIndicator(self)
+        self._bubble: Optional[AlertBubble] = None
         self._toggle = CollapseToggle(self)
         # 这个连接之前漏了：开关点了没反应，就是因为 clicked 根本没接到槽上
         self._toggle.clicked.connect(self.toggle_collapsed)
@@ -208,6 +230,38 @@ class Sidebar(QWidget):
     def set_selected(self, key: str) -> None:
         for btn in self._buttons:
             btn.set_selected(btn.key == key)
+
+    def profile_button(self) -> NavButton:
+        return self._buttons[-1]
+
+    def set_login_alert(self, active: bool, text: str = "登陆状态已过期") -> None:
+        """没登录时：个人中心图标加黄色感叹号，并在旁边弹一个黄色气泡。
+
+        都用这个告警位，但**措辞按原因区分**：
+          会话失效（自动重登也失败）→ "登陆状态已过期"
+          用户自己点了退出登录      → "已退出登录"
+          当前账号的缓存被删掉      → "缓存已删除，已退出登录"
+        不区分的话，用户主动退出却被告知"已过期"，是一种误导。
+        措辞由调用方给：主窗口盯着登录态的统一入口，别在各处零散地弹。
+        """
+        self.profile_button().set_alert(active)
+        if active:
+            host = self.window()
+            if self._bubble is None or self._bubble.parent() is not host:
+                self._bubble = AlertBubble(host)
+            self._bubble.set_text(text)
+            self._bubble.show()
+            self._place_bubble()
+            self._bubble.raise_()          # 置顶，压住内容区
+        elif self._bubble is not None:
+            self._bubble.hide()
+
+    def _place_bubble(self) -> None:
+        if self._bubble is None or not self._bubble.isVisible():
+            return
+        btn = self.profile_button()
+        at = btn.mapTo(self.window(), QPoint(btn.width() + 2, 0))
+        self._bubble.move(at.x(), at.y() + (btn.height() - self._bubble.height()) // 2)
 
     def set_busy(self, busy: bool) -> None:
         """有任何加载/上传/下载/登录在跑时让指示器转起来。"""
@@ -269,6 +323,8 @@ class Sidebar(QWidget):
         self._toggle.setGeometry(int((t.metrics.sidebar_w_collapsed - self._toggle.width()) / 2),
                                  divider_y - self._toggle.height() - t.metrics.space_xs,
                                  self._toggle.width(), self._toggle.height())
+        self._place_bubble()      # 气泡跟着个人中心的位置走
+
         # 加载指示器放在折叠开关上方
         self._busy.setGeometry(int((t.metrics.sidebar_w_collapsed - self._busy.width()) / 2),
                                self._toggle.y() - self._busy.height() - t.metrics.space_xs,
@@ -355,6 +411,57 @@ class BusyIndicator(QWidget):
         p.setPen(QPen(QColor(pal.accent), 2.2, Qt.PenStyle.SolidLine,
                       Qt.PenCapStyle.RoundCap))
         p.drawArc(QRectF(-r, -r, r * 2, r * 2), 0, 100 * 16)
+        p.end()
+
+
+
+class AlertBubble(QWidget):
+    """微信式语言气泡：圆角矩形 + 左侧小尖角，提示"登录状态已过期"。
+
+    它挂在**窗口**上而不是侧栏里：侧栏只有 64px 宽，气泡放进去会被裁掉；
+    挂到窗口再 raise_() 才能浮在内容区之上。
+    """
+
+    def __init__(self, parent: QWidget, text: str = "登陆状态已过期") -> None:
+        super().__init__(parent)
+        self._text = text
+        t = theme()
+        fm = QFontMetrics(ui_font(t.small_font_size))
+        self._w = fm.horizontalAdvance(text) + t.metrics.space_md * 2 + 12
+        self._h = fm.height() + t.metrics.space_sm + 6
+        self.resize(self._w, self._h)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+    def set_text(self, text: str) -> None:
+        if text == self._text:
+            return
+        self._text = text
+        t = theme()
+        fm = QFontMetrics(ui_font(t.small_font_size))
+        self._w = fm.horizontalAdvance(text) + t.metrics.space_md * 2 + 12
+        self.resize(self._w, self._h)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        t = theme()
+        pal = t.palette
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        tail = 7
+        body = QRectF(tail, 0, self._w - tail, self._h)
+        p.setBrush(QColor(pal.warning))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawPath(rounded_path(body, 8))
+        tip = QPainterPath()
+        cy = self._h / 2
+        tip.moveTo(tail, cy - 5)
+        tip.lineTo(0, cy)
+        tip.lineTo(tail, cy + 5)
+        tip.closeSubpath()
+        p.drawPath(tip)
+        p.setFont(ui_font(t.small_font_size, QFont.Weight.Medium))
+        p.setPen(QColor(pal.bg))
+        p.drawText(body, Qt.AlignmentFlag.AlignCenter, self._text)
         p.end()
 
 

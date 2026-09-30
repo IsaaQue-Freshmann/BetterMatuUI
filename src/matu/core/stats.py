@@ -4,9 +4,10 @@
 
   正确率 = 拿过满分的题目数 / (这些题里未拿满分的提交次数 + 拿过满分的题目数)
            —— 分子是**题目数**而不是提交次数，所以反复刷同一道题不会提高它
-  考勤度 = 日均提交次数（有提交的那天算 1，没提交的那天算 0.2，
+  考勤度 = 日均提交次数（有提交的那天算 1、没提交的那天按 IDLE_DAY_WEIGHT 折算，
            从账号 ID 前四位那年的 9 月 1 日起算）再映射到 0-100；
-           用对数，20 次/天 = 100，再高也只是趋近 100，不会爆表
+           用对数，ATTENDANCE_ANCHOR（默认 20）次/天 = 100，
+           再高也只是趋近 100，不会爆表
   狗卷度 = 拿过满分的题目数 / 该账号题库总题数
 
 评级取三项均值：100-85 S，85-70 A，70-60 B，60-40 C，40 以下 D
@@ -21,7 +22,9 @@ from typing import Dict, List, Optional, Tuple
 
 # 考勤度锚点：日均多少次算满分
 ATTENDANCE_ANCHOR = 20.0
-# 没提交的那天按多少天计入分母
+# 考勤度的分母权重：有提交的那天算几天、没提交的那天折算几天。
+# 说明文字（Stats.explain）里的数字都从这两个常量取，改算法不必再改文案。
+ACTIVE_DAY_WEIGHT = 1.0
 IDLE_DAY_WEIGHT = 0.2
 # 热力图：53 个格子，每格 1 天
 HEAT_CELLS = 53
@@ -53,14 +56,20 @@ class Stats:
     first_submit_day: Optional[date] = None
 
     def explain(self) -> List[Tuple[str, str]]:
-        """给界面用的口径说明，免得数字看起来像黑箱。"""
+        """给界面用的口径说明，免得数字看起来像黑箱。
+
+        文字里的权重与锚点一律从上面的常量取：改算法时只改常量，
+        说明跟着一起变，不会再出现"代码算 0.2、说明写 0.01"的脱节。
+        """
+        idle_days = max(0, self.window_days - self.active_days)
         return [
             ("正确率", f"{self.tasks_with_100} 道满分 / "
                        f"（{self.non100_submissions} 次非满分提交 + "
                        f"{self.tasks_with_100} 道满分）= {self.accuracy:.1f}"),
-            ("考勤度", f"{self.total_submissions} 次提交 / {self.avg_per_day:.2f} 日均"
-                       f"（{self.active_days} 个活跃日 + {self.window_days - self.active_days} "
-                       f"个空日×0.01）→ {self.attendance:.1f}"),
+            ("考勤度", f"{self.total_submissions} 次提交 ÷（活跃 {self.active_days} 日"
+                       f"×{ACTIVE_DAY_WEIGHT:g} + 空 {idle_days} 日×{IDLE_DAY_WEIGHT:g}）"
+                       f"= {self.avg_per_day:.2f} 次/日 → {self.attendance:.1f}"
+                       f"（{ATTENDANCE_ANCHOR:g} 次/日 记满）"),
             ("狗卷度", f"{self.tasks_with_100} 道满分 / 题库 {self.bank_size} 道 "
                        f"= {self.diligence:.1f}"),
         ]
@@ -126,12 +135,13 @@ def compute_stats(store, username: str = "", today: Optional[date] = None) -> St
     denom = st.non100_submissions + st.tasks_with_100
     st.accuracy = (st.tasks_with_100 / denom * 100) if denom else 0.0
 
-    # ---- 考勤度：活跃日算 1、空日算 0.01 ----
+    # ---- 考勤度：活跃日算满、空日按 IDLE_DAY_WEIGHT 折算 ----
     start = attendance_start(username) or st.first_submit_day or today
     st.start_day = start
     st.window_days = max(1, (today - start).days + 1)
     st.active_days = sum(1 for d in days if start <= d <= today)
-    weight = st.active_days * 1.0 + max(0, st.window_days - st.active_days) * IDLE_DAY_WEIGHT
+    weight = (st.active_days * ACTIVE_DAY_WEIGHT
+              + max(0, st.window_days - st.active_days) * IDLE_DAY_WEIGHT)
     st.avg_per_day = (st.total_submissions / weight) if weight else 0.0
     if st.avg_per_day > 0:
         st.attendance = min(100.0, 100.0 * math.log1p(st.avg_per_day)

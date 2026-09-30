@@ -10,9 +10,9 @@
 `CodeArea`，不是另写一份。
 
 内容全部属于当前账号（题库 = 该账号可见的题），和「我的班级」共用
-同一个按账号隔离的库。换账号后要重爬，界面上的刷新按钮就是干这个的。
+同一个按账号隔离的库。换账号后要重新加载，界面上的刷新按钮就是干这个的。
 
-新账号登录后会**边爬边往目录里加**：每爬完一题，如果"题目总表"是展开的，
+新账号登录后会**边加载边往目录里加**：每加载完一题，如果"题目总表"是展开的，
 就把这条插进去；折叠状态下看不出区别——这正是需求里要的行为。
 """
 
@@ -46,7 +46,7 @@ class BankCrawlWorker(QThread):
     done = Signal(dict)
     failed = Signal(str)
 
-    CRAWL_INTERVAL = 0.2          # 用户指定的节奏：0.2 秒/题
+    CRAWL_INTERVAL = 0.1          # 用户指定的节奏：0.2 秒/题
     CRAWL_JITTER = 0.05
     MAX_REQUESTS = 700
 
@@ -84,7 +84,7 @@ class BankCrawlWorker(QThread):
 class ListPanel(QWidget):
     """右区的只读列表：作业状态 / 提交总结 / 搜索结果都用它。"""
 
-    row_activated = Signal(int)      # task_id
+    row_activated = Signal(tuple)    # ("task", task_id) 或 ("submission", aid, task_id)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -105,6 +105,7 @@ class ListPanel(QWidget):
         self._search.textChanged.connect(self._on_search)
         self._rows: List[tuple] = []
         self._task_ids: List[int] = []
+        self._payloads: List[tuple] = []      # 每行的点击载荷
         self._searchable = False
         self.apply_theme()
 
@@ -151,10 +152,13 @@ class ListPanel(QWidget):
 
     def show_rows(self, title: str, hint: str,
                   rows: List[tuple],
-                  task_ids: List[int], searchable: bool = False) -> None:
+                  task_ids: List[int], searchable: bool = False,
+                  payloads: Optional[List[tuple]] = None) -> None:
         self._title.setText(title)
         self._hint.setText(hint)
         self._rows, self._task_ids = rows, task_ids
+        self._payloads = payloads if payloads is not None else [
+            ("task", tid) for tid in task_ids]
         self._searchable = searchable
         self._search.setVisible(searchable)
         if searchable:
@@ -168,20 +172,23 @@ class ListPanel(QWidget):
         if not needle:
             self._list.set_rows(self._rows)
             return
-        keep = [(row, tid) for row, tid in zip(self._rows, self._task_ids)
+        keep = [(row, tid, pay)
+                for row, tid, pay in zip(self._rows, self._task_ids, self._payloads)
                 if needle in row[1].lower() or needle in str(tid)]
-        self._list.set_rows([r for r, _ in keep])
-        self._task_ids = [tid for _, tid in keep]
+        self._list.set_rows([r for r, _t, _p in keep])
+        self._task_ids = [t for _r, t, _p in keep]
+        self._payloads = [p for _r, _t, p in keep]
 
     def _on_row(self, index: int) -> None:
-        if 0 <= index < len(self._task_ids):
-            self.row_activated.emit(self._task_ids[index])
+        if 0 <= index < len(self._payloads):
+            self.row_activated.emit(self._payloads[index])
 
 
 class TaskCenterPage(QWidget):
     """题目中心。左目录 + 右内容（编辑器或列表）。"""
 
     bank_crawl_state = Signal(str)      # 供外部（设置页/状态栏）显示
+    data_loaded = Signal()              # 一轮加载完成：让所有页面刷新
 
     def __init__(self, workspace, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -225,7 +232,7 @@ class TaskCenterPage(QWidget):
         self._browser.node_activated.connect(self._on_activated)
         self._browser.refresh_requested.connect(self.start_bank_crawl)
         self._code.submit_confirmed.connect(self._submit)
-        self._list.row_activated.connect(self.open_task)
+        self._list.row_activated.connect(self._on_list_row)
         self._ws.changed.connect(self.reload)
         self.bank_crawl_state.connect(self._set_status)
 
@@ -251,14 +258,14 @@ class TaskCenterPage(QWidget):
             # 没有题库数据时给个明确指引，而不是一片空白
             self._stack.setCurrentWidget(self._list)
             self._list.show_rows(
-                "还没有题库数据", "当前账号还没有爬过题库。点目录栏上的刷新按钮"
-                                   "开始加载（约 0.5 秒/题），爬到的题会边爬边出现在目录里。",
+                "还没有题库数据", "当前账号还没有加载过题库。点目录栏上的刷新按钮"
+                                   "开始加载（约 0.5 秒/题），加载到的题会边加载边出现在目录里。",
                 [], [])
 
     def _reindex(self) -> None:
-        """把树上已有的目录项记进索引，供"边爬边加"去重。
+        """把树上已有的目录项记进索引，供"边加载边加"去重。
 
-        不建这个索引的话，重新爬一个已有数据的账号时，已经挂在树上的题
+        不建这个索引的话，重新加载一个已有数据的账号时，已经挂在树上的题
         会被 _on_task_added 再插一遍 —— 目录里出现重复条目。
         """
         self._bank_items.clear()
@@ -293,6 +300,25 @@ class TaskCenterPage(QWidget):
             if child.task_id == task_id:
                 return child
         return None
+
+    def _on_list_row(self, payload: tuple) -> None:
+        """列表点行：历史记录打开那一次提交，题目则进工作区。"""
+        if not payload:
+            return
+        if payload[0] == "submission" and len(payload) >= 3:
+            self.open_submission_record(int(payload[1]), int(payload[2]))
+        else:
+            self.open_task(int(payload[1]))
+
+    def open_submission_record(self, assignment_id: int, task_id: int) -> None:
+        """从「作业状态」进入：直接打开对应的那条历史记录（只读）。"""
+        node = self._find_task_node(task_id)
+        if node is None:
+            return
+        self._browser.select_node(node, reveal=False)
+        self._code.set_task(node, self._ws.store)      # 先备好上下文
+        self._stack.setCurrentWidget(self._code)
+        self._code.open_submission(assignment_id)      # 再打开那条记录
 
     def open_task(self, task_id: int) -> None:
         """直接进入某题的代码区（列表点击、回溯都走这里）。"""
@@ -352,15 +378,19 @@ class TaskCenterPage(QWidget):
                              rows, ids, searchable=True)
 
     def _show_submissions(self) -> None:
-        rows, ids = [], []
+        rows, ids, payloads = [], [], []
         for s in self._ws.store.get_submissions_all():
             rows.append(("check" if s.get("score") == 100 else "file-code",
                          s.get("name", ""),
                          s.get("submitted_at", ""), f"{s.get('score')} 分",
                          f"#{s['task_id']}"))
             ids.append(int(s["task_id"]))
-        self._list.show_rows("作业状态", f"共 {len(rows)} 条提交记录（最近在前）。"
-                                        "点击一条进入该题。", rows, ids)
+            # 带上该次提交的 id：点进去直接打开这条历史记录（只读）
+            payloads.append(("submission", int(s["assignment_id"]), int(s["task_id"])))
+        self._list.show_rows("作业状态",
+                             f"共 {len(rows)} 条提交记录（最近在前）。"
+                             "点击一条直接打开那次提交的源码（只读）。",
+                             rows, ids, payloads=payloads)
 
     def _show_grades(self) -> None:
         rows, ids = [], []
@@ -402,7 +432,7 @@ class TaskCenterPage(QWidget):
                 f"数据完整（本地 {cached} / 站点 {remote} 题）")
 
     def maybe_autocrawl(self) -> None:
-        """新账号自动开爬。
+        """新账号自动开始加载。
 
         判定很直接：已登录、有账号、但库里一道题都没有 —— 那就是新账号，
         需要把该账号的数据整份拉一遍。
@@ -444,7 +474,7 @@ class TaskCenterPage(QWidget):
         self._bank_worker.start()
 
     def _on_task_added(self, task_id: int) -> None:
-        """边爬边加目录项。
+        """边加载边加目录项。
 
         只有"题目总表"是**展开**的时候才插进去——折叠时不做任何可见变化，
         这样用户不展开就不会看到列表在跳。
@@ -466,8 +496,10 @@ class TaskCenterPage(QWidget):
     def _on_crawl_done(self, counts: dict) -> None:
         tail = "（已停止）" if counts.get("stopped") else ""
         self.bank_crawl_state.emit(
-            f"题库加载完成{tail}：{counts.get('details', 0)} 道题。")
+            f"加载完成{tail}：{counts.get('pages', 0)} 页题目、"
+            f"{counts.get('submissions', 0)} 条提交记录。")
         self.reload()
+        self.data_loaded.emit()      # 主窗口据此刷新所有页面
 
     # ---------------- 提交 ----------------
 
@@ -478,6 +510,7 @@ class TaskCenterPage(QWidget):
             return
         self._code.set_submitting()
         self._worker = SubmitWorker(self._ws, node, source)
+        self._worker.progress.connect(self._code._result.set_submitting)
         self._worker.succeeded.connect(self._code.show_result)
         self._worker.failed.connect(self._code.show_error)
         self._worker.start()

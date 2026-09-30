@@ -3,7 +3,7 @@
 
 **为什么可以内置**：系统帮助里的学生手册、提交注意事项是站点的静态内容，
 对所有账号完全一样，不像班级/题目那样随账号不同，所以放进项目、
-不必每个账号各爬一遍。
+不必每个账号各加载一遍。
 
 源是缓存里的 Word 导出的 HTML（结构很脏），这里做一次清洗：
 段落、列表、代码块分开，代码块保留原样缩进。
@@ -227,6 +227,15 @@ def main() -> int:
             "id": doc["id"], "title": doc["title"], "file": doc["out"], "url": doc["url"],
             "lines": len(lines),
         })
+
+    # 项目自身的说明文档不在站点上，单独登记（重跑本脚本不会冲掉它）
+    about = OUT_DIR / "about_bettermatu.md"
+    if about.exists():
+        lines = about.read_text(encoding="utf-8").splitlines()
+        index_lines.append({"id": "about", "title": "关于 BetterMatuUI",
+                            "file": "about_bettermatu.md", "url": "",
+                            "lines": len(lines)})
+        print(f"  {about.relative_to(ROOT)}  {len(lines)} 行  (项目自带)")
 
     if index_lines:
         import json

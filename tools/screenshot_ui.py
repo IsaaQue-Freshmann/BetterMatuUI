@@ -47,6 +47,11 @@ def main() -> int:
 
     config = Config.load()
     config.appearance = "light"
+    # 这是渲染工具，**不许动用户的设置**：里面跑的是真 App、真 Config，
+    # 而界面里好几条路径会存盘（折叠开关、登录时切账号、改请求策略…），
+    # 跑一次截图就会把真实的 ~/.bettermatu/settings.json 写掉。
+    # 把 save 焊死在这里，比逐个去猜哪条路径会写可靠。
+    Config.save = lambda self: None                # noqa: E731
 
     print("渲染中（离屏）…")
     for mode in ("light", "dark"):
@@ -127,6 +132,11 @@ def main() -> int:
             help_page._on_selected(tree.children[1])             # noqa: SLF001
             QApplication.instance().processEvents()
         shot(win, f"07_help_{mode}")
+
+        # 8) 数据中心（默认首页）：评级说明文字 + 热力图 + 雷达 + 折线 + 明细
+        win._sidebar.set_selected("data_center")                 # noqa: SLF001
+        win._on_navigate("data_center")                          # noqa: SLF001
+        shot(win, f"08_data_center_{mode}")
 
         win.close()
     print(f"\n完成，产物在 {OUT}")
